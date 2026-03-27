@@ -130,6 +130,8 @@ xnn_datatype getDataType(const DataType& data_type) {
       return xnn_datatype::xnn_datatype_pfp32;
     case DataType::xnn_datatype_bf16:
       return xnn_datatype::xnn_datatype_bf16;
+    case DataType::xnn_datatype_mqint8:
+      return xnn_datatype::xnn_datatype_mqint8;
     default:
       return xnn_datatype::xnn_datatype_invalid;
   }
@@ -144,6 +146,8 @@ bool isQuantizedDataType(const xnn_datatype data_type) {
     case xnn_datatype::xnn_datatype_qcint32:
     case xnn_datatype::xnn_datatype_qcint4:
     case xnn_datatype::xnn_datatype_qdint8:
+    case xnn_datatype::xnn_datatype_qbint4:
+    case xnn_datatype::xnn_datatype_mqint8:
       return true;
     default:
       return false;
@@ -475,8 +479,12 @@ Error defineTensor(
       }
       case fb_xnnpack::XNNQuantParams::PerChannelGroupQuant: {
         xnn_datatype datatype = getDataType(tensor_value->datatype());
+        fprintf(stderr, "[mqint8-diag] PerChannelGroupQuant: fb_datatype=%d xnn_datatype=%d (qbint4=%d, mqint8=%d)\n",
+               (int)tensor_value->datatype(), (int)datatype,
+               (int)xnn_datatype::xnn_datatype_qbint4, (int)xnn_datatype::xnn_datatype_mqint8);
         ET_CHECK_OR_RETURN_ERROR(
-            datatype == xnn_datatype::xnn_datatype_qbint4,
+            datatype == xnn_datatype::xnn_datatype_qbint4 ||
+            datatype == xnn_datatype::xnn_datatype_mqint8,
             Internal,
             "Unsupported datatype for per channel group quantization: %d",
             datatype);
@@ -518,8 +526,12 @@ Error defineTensor(
             static_cast<size_t>(scale_numel),
             output_channels,
             group_size);
-        int32_t zero_point =
-            (datatype == xnn_datatype::xnn_datatype_qbint4 ? 8 : 0);
+        int32_t zero_point = 0;
+        if (datatype == xnn_datatype::xnn_datatype_qbint4) {
+          zero_point = 8;   // 4-bit nibble: unsigned [0,15], subtract 8
+        } else if (datatype == xnn_datatype::xnn_datatype_mqint8) {
+          zero_point = 128; // 8-bit: unsigned [0,247], subtract 128
+        }
         ET_LOG(
             Debug,
             "define quant tensor (per channel group): buffer_ptr: %p, scale.numel(): %u, channel_dim: %u, grpup_size: %zu, output_channels: %zu, dtype: %u, zero_point: %d, datatype: %d\n",
@@ -717,6 +729,8 @@ Error defineFullyConnectedNode(
       remapped_ids.at(graph_node->bias_id()),
       remapped_ids.at(graph_node->output_id()),
       graph_node->flags());
+  if (status != xnn_status_success) {
+  }
   ET_CHECK_OR_RETURN_ERROR(
       status == xnn_status_success,
       Internal,

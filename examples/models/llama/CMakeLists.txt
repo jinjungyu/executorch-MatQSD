@@ -225,3 +225,54 @@ elseif(UNIX)
   set_target_properties(llama_main PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'")
 endif()
 # Windows doesn't need rpath - DLLs are found via standard Windows search order
+
+# MatQSD test binary
+add_executable(matqsd_test ${CMAKE_CURRENT_LIST_DIR}/matqsd_test.cpp)
+target_include_directories(matqsd_test PUBLIC ${_common_include_directories})
+target_link_libraries(matqsd_test PUBLIC extension_module_static extension_tensor ${link_libraries})
+target_compile_options(matqsd_test PUBLIC ${_common_compile_options})
+
+# PPL evaluator
+add_executable(ppl_eval ${CMAKE_CURRENT_LIST_DIR}/ppl_eval.cpp)
+target_include_directories(ppl_eval PUBLIC ${_common_include_directories})
+target_link_libraries(ppl_eval PUBLIC llama_runner ${link_libraries})
+target_compile_options(ppl_eval PUBLIC ${_common_compile_options})
+
+# KV test
+add_executable(kv_test ${CMAKE_CURRENT_LIST_DIR}/kv_test.cpp)
+target_include_directories(kv_test PUBLIC ${_common_include_directories})
+target_link_libraries(kv_test PUBLIC extension_module_static extension_tensor ${link_libraries})
+target_compile_options(kv_test PUBLIC ${_common_compile_options})
+
+# SD KV bench (real SD with KV cache)
+add_executable(sd_kv_bench ${CMAKE_CURRENT_LIST_DIR}/sd_kv_bench.cpp)
+target_include_directories(sd_kv_bench PUBLIC ${_common_include_directories})
+target_link_libraries(sd_kv_bench PUBLIC extension_module_static extension_tensor ${link_libraries})
+target_compile_options(sd_kv_bench PUBLIC ${_common_compile_options})
+
+# SD bench (MatQSD draft-verify cycle timing)
+add_executable(sd_bench ${CMAKE_CURRENT_LIST_DIR}/sd_bench.cpp)
+target_include_directories(sd_bench PUBLIC ${_common_include_directories})
+target_link_libraries(sd_bench PUBLIC extension_module_static extension_tensor ${link_libraries})
+target_compile_options(sd_bench PUBLIC ${_common_compile_options})
+
+# SD runner
+add_executable(sd_runner ${CMAKE_CURRENT_LIST_DIR}/sd_runner.cpp)
+target_include_directories(sd_runner PUBLIC ${_common_include_directories})
+target_link_libraries(sd_runner PUBLIC llama_runner ${link_libraries})
+target_compile_options(sd_runner PUBLIC ${_common_compile_options})
+
+add_executable(kv_multi_test ${CMAKE_CURRENT_LIST_DIR}/kv_multi_test.cpp)
+target_include_directories(kv_multi_test PUBLIC ${_common_include_directories})
+target_link_libraries(kv_multi_test PUBLIC extension_module_static extension_tensor ${link_libraries})
+target_compile_options(kv_multi_test PUBLIC ${_common_compile_options})
+
+add_executable(test_s3 ${CMAKE_CURRENT_LIST_DIR}/test_s3.cpp)
+target_include_directories(test_s3 PUBLIC ${_common_include_directories})
+target_link_libraries(test_s3 PUBLIC extension_module_static extension_tensor ${link_libraries})
+target_compile_options(test_s3 PUBLIC ${_common_compile_options})
+
+add_executable(test_mqint8 ${CMAKE_CURRENT_BINARY_DIR}/test_mqint8.cpp)
+target_include_directories(test_mqint8 PUBLIC ${_common_include_directories})
+target_link_libraries(test_mqint8 PUBLIC extension_module_static extension_tensor ${link_libraries})
+target_compile_options(test_mqint8 PUBLIC ${_common_compile_options})

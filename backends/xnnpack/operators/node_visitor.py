@@ -233,12 +233,11 @@ class NodeVisitor:
                 return XNNDatatype.xnn_datatype_qcint32
             elif quant_params.dtype == torch.int8:
                 if quant_params.per_channel_group:
-                    # 4-bit per channel group quantized weights
-                    # No 8-bit support yet
-                    assert (
-                        quant_params.is_qc4w is True
-                    ), "Only 4-bit per channel group quantization is supported"
-                    return XNNDatatype.xnn_datatype_qbint4
+                    if quant_params.is_qc4w:
+                        return XNNDatatype.xnn_datatype_qbint4
+                    else:
+                        # 8-bit per channel group (blocked int8) - for MatQSD
+                        return XNNDatatype.xnn_datatype_mqint8
                 else:
                     # 4/8-bit per channel quantized weights
                     return (
@@ -349,9 +348,10 @@ class NodeVisitor:
         ), f"For per_channel_group quant, num_groups and group_size must be > 0, but got num_groups: {num_groups}, group_size: {quant_params.group_size}"
         output_channels = dims[quant_params.axis]
         input_channels = dims[quant_params.axis ^ 1]
+        alignment = 32 if quant_params.is_qc4w else 16
         assert (
-            quant_params.group_size % 32 == 0
-        ), f"Delegation to XNNPACK requires group_size to be a multiple of 32, but got {quant_params.group_size}"
+            quant_params.group_size % alignment == 0
+        ), f"Delegation to XNNPACK requires group_size to be a multiple of {alignment}, but got {quant_params.group_size}"
         assert (
             output_channels == cast(torch.Tensor, quant_params.scale).shape[0]
         ), f"For per_channel_group quant, expecting output channels to match scale.shape[0], gut got: {output_channels}, scale.shape[0]: {quant_params.scale.shape[0]}"
@@ -365,8 +365,9 @@ class NodeVisitor:
             input_channels / quant_params.group_size == num_groups
         ), f"For per_channel_group quant, expecting input channels // group_size == num_groups, but got ic: {input_channels}, group_size: {quant_params.group_size}, num_groups: {num_groups}"
 
-        # For now group quantization is only supported for 4b weights
-        assert quant_params.is_qc4w, "Only 4b group quantization is supported"
+        # Group quantization is supported for 4b (qb4w) and MatQSD (qb4w_matqsd/qb8w_matqsd) weights
+        assert quant_params.is_qc4w or quant_params.per_channel_group, \
+            "Group quantization requires 4b or 8b per-group weight"
 
     def define_tensor(  # noqa: C901
         self,
@@ -522,6 +523,48 @@ class NodeVisitor:
         inp = inp.contiguous().view(-1)
         return (inp[1::2] << 4 | inp[::2]).view(oc, int(ic / 2))
 
+    # Class-level flag: set True to apply rounding in serializer
+    # (kernel must then apply reversal)
+    MQINT8_APPLY_ROUNDING = True
+
+    @staticmethod
+    def convert_to_mqint8(inp: torch.Tensor) -> torch.Tensor:
+        """
+        Convert int8 MatQSD weight to nibble-pair format for mqint8 packer.
+
+        Input:  int8 [oc, ic], range [-128, 119] (= qweight - 128)
+        Output: uint8 [oc, ic], layout per row: [upper_pairs(ic/2) | lower_pairs(ic/2)]
+                Each nibble-pair byte: (nib[k+1] << 4) | nib[k], unsigned [0,15]
+        """
+        assert inp.ndim == 2, f"convert_to_mqint8: expecting 2d, got {inp.ndim}"
+        oc, ic = inp.shape
+        assert ic % 2 == 0, f"convert_to_mqint8: expecting even ic, got {ic}"
+
+        qw = (inp.to(torch.int16) + 128).to(torch.uint8)
+
+        upper_nib = qw >> 4       # [0, 15]
+        lower_nib = qw & 0x0F     # [0, 15]
+
+        if NodeVisitor.MQINT8_APPLY_ROUNDING:
+            # Apply rounding: rounded_upper = min(upper + round_bit, 15)
+            # Kernel must reverse: original = rounded - round_bit
+            round_bit = (lower_nib >> 3) & 1
+            upper_nib = torch.clamp(
+                upper_nib.to(torch.int16) + round_bit.to(torch.int16), max=15
+            ).to(torch.uint8)
+            print(f"[mqint8] convert_to_mqint8 WITH ROUNDING: shape={inp.shape}, range=[{inp.min()},{inp.max()}]")
+        else:
+            print(f"[mqint8] convert_to_mqint8 NO rounding: shape={inp.shape}, range=[{inp.min()},{inp.max()}]")
+
+        # Pack adjacent pairs: byte = (nib[k+1] << 4) | nib[k]
+        upper_pairs = (upper_nib[:, 1::2] << 4) | upper_nib[:, 0::2]  # [oc, ic/2]
+        lower_pairs = (lower_nib[:, 1::2] << 4) | lower_nib[:, 0::2]  # [oc, ic/2]
+
+        # Concatenate per row: [upper_pairs | lower_pairs]
+        result = torch.cat([upper_pairs, lower_pairs], dim=1)  # [oc, ic]
+        print(f"[mqint8] nibble split+pack: upper={upper_pairs.nbytes}B + lower={lower_pairs.nbytes}B")
+        return result
+
     def get_serialized_buffer_index(
         self,
         tensor: torch.fx.Node,
@@ -601,6 +644,14 @@ class NodeVisitor:
 
         if quant_params is not None and quant_params.is_qc4w:
             const_val = self.convert_to_qc4w(const_val)
+        elif (
+            quant_params is not None
+            and quant_params.per_channel_group
+            and not quant_params.is_qc4w
+            and quant_params.dtype == torch.int8
+        ):
+            # mqint8: convert int8 → nibble-pair [upper_pairs | lower_pairs]
+            const_val = self.convert_to_mqint8(const_val)
 
         size = const_val.untyped_storage().nbytes()
         array_type = ctypes.c_char * size
