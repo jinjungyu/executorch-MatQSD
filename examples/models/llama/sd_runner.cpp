@@ -275,23 +275,35 @@ int main(int argc, char** argv) {
   std::cout << "Draft/Verify split:        " << (int)(avg_draft_ms/(avg_draft_ms+avg_verify_ms)*100)
             << "% / " << (int)(avg_verify_ms/(avg_draft_ms+avg_verify_ms)*100) << "%" << std::endl;
 
-  // AR baseline
-  if (single_model) xnn_set_mqint8_global_mode(1);
-  auto* ar_runner = single_model ? model.get() : target_model_separate.get();
-  std::cout << "\n=== AR-8bit baseline ===" << std::endl;
-  ar_runner->reset();
-  std::vector<std::string> ar_tokens;
-  llm::GenerationConfig ar_cfg{.temperature = 0.0f};
-  ar_cfg.max_new_tokens = max_new;
-  ar_cfg.seq_len = FLAGS_seq_len;
-  auto ar_start = std::chrono::high_resolution_clock::now();
-  ar_runner->generate(FLAGS_prompt, ar_cfg,
-      [&](const std::string& p) { ar_tokens.push_back(p); });
-  auto ar_end = std::chrono::high_resolution_clock::now();
-  double ar_elapsed = std::chrono::duration<double>(ar_end - ar_start).count();
-  double ar_tps = ar_tokens.size() / ar_elapsed;
-  std::cout << "AR: " << ar_tokens.size() << " tokens, " << ar_tps << " TPS" << std::endl;
-  std::cout << "\nSD speedup: " << tps / ar_tps << "x" << std::endl;
+  // AR baselines (same model, same prompt, same max_new_tokens)
+  auto run_ar_baseline = [&](int mode, const char* label) {
+    if (single_model) xnn_set_mqint8_global_mode(mode);
+    auto* ar_runner = single_model ? model.get() : target_model_separate.get();
+    ar_runner->reset();
+    std::vector<std::string> ar_tokens;
+    llm::GenerationConfig ar_cfg{.temperature = 0.0f};
+    ar_cfg.max_new_tokens = max_new;
+    ar_cfg.seq_len = FLAGS_seq_len;
+    auto ar_start = std::chrono::high_resolution_clock::now();
+    ar_runner->generate(FLAGS_prompt, ar_cfg,
+        [&](const std::string& p) { ar_tokens.push_back(p); });
+    auto ar_end = std::chrono::high_resolution_clock::now();
+    double ar_elapsed = std::chrono::duration<double>(ar_end - ar_start).count();
+    double ar_tps = ar_tokens.size() / ar_elapsed;
+    std::cout << "\n=== " << label << " ===" << std::endl;
+    std::cout << ar_tokens.size() << " tokens, " << ar_tps << " TPS" << std::endl;
+    return ar_tps;
+  };
+
+  double ar4_tps = run_ar_baseline(0, "AR-4bit baseline");
+  double ar8_tps = run_ar_baseline(1, "AR-8bit baseline");
+
+  std::cout << "\n=== Summary ===" << std::endl;
+  std::cout << "AR-4bit: " << ar4_tps << " TPS" << std::endl;
+  std::cout << "AR-8bit: " << ar8_tps << " TPS" << std::endl;
+  std::cout << "4/8 ratio: " << ar4_tps / ar8_tps << "x" << std::endl;
+  std::cout << "SD: " << tps << " TPS" << std::endl;
+  std::cout << "SD speedup vs AR-8bit: " << tps / ar8_tps << "x" << std::endl;
 
   return 0;
 }
