@@ -122,6 +122,10 @@ class ModelArgs:
     sliding_window: Optional[int] = None
     # Map layer_id → donor_layer_id for KV cache sharing (Gemma-4)
     kv_donor_map: Optional[Dict[int, int]] = None
+    # Per-layer embedding dimension (Gemma-4: 256). 0 = disabled.
+    per_layer_embed_dim: int = 0
+    # Final logit softcapping (Gemma-4: 30.0). 0 = disabled.
+    final_logit_softcapping: float = 0.0
 
     def __post_init__(self):
         if self.n_kv_heads is None:

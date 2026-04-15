@@ -43,18 +43,31 @@ _HF_TO_ET = {
     "model.language_model.layers.{}.mlp.gate_proj.weight": "layers.{}.feed_forward.w1.weight",
     "model.language_model.layers.{}.mlp.down_proj.weight": "layers.{}.feed_forward.w2.weight",
     "model.language_model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
+    # Per-layer embedding
+    "model.language_model.layers.{}.per_layer_input_gate.weight": "layers.{}.per_layer_input_gate.weight",
+    "model.language_model.layers.{}.per_layer_projection.weight": "layers.{}.per_layer_projection.weight",
+    "model.language_model.layers.{}.post_per_layer_input_norm.weight": "layers.{}.post_per_layer_input_norm.weight",
+    "model.language_model.layers.{}.layer_scalar": "layers.{}.layer_scalar",
+}
+
+# Per-layer embedding table (special: not per-layer indexed)
+_HF_TO_ET_SPECIAL = {
+    "model.language_model.embed_tokens_per_layer.weight": "embed_tokens_per_layer.weight",
 }
 
 
 def _get_mapped_key(key: str) -> str:
     """Map HF key to ET key, handling layer indices."""
+    # Check special (non-layer-indexed) keys first
+    if key in _HF_TO_ET_SPECIAL:
+        return _HF_TO_ET_SPECIAL[key]
     for hf_pat, et_pat in _HF_TO_ET.items():
         if "{}" in hf_pat:
             prefix = hf_pat.split("{}")[0]
             suffix = hf_pat.split("{}")[1]
             if key.startswith(prefix) and key.endswith(suffix):
                 rest = key[len(prefix):]
-                layer_id = rest[:rest.index(".")]
+                layer_id = rest[:rest.index(".") if "." in rest else len(rest)]
                 return et_pat.replace("{}", layer_id)
         elif key == hf_pat:
             return et_pat
@@ -83,8 +96,8 @@ def gemma4_to_executorch(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
     skipped = []
 
     for key, value in state_dict.items():
-        # Skip per-layer embeddings (v1 simplification)
-        if "per_layer" in key or "embed_tokens.weight_per_layer" in key:
+        # Skip per-layer model projection (not needed for text-only inference)
+        if "per_layer_model_projection" in key or "per_layer_projection_norm" in key:
             skipped.append(key)
             continue
         # Skip audio/vision components

@@ -95,7 +95,10 @@ class TransformerBlock(nn.Module):
         if args.moe:
             self.block_sparse_moe = MOEFeedForward(args)
         else:
-            self.feed_forward = FeedForward(dim=args.dim, hidden_dim=hidden_dim)
+            self.feed_forward = FeedForward(
+                dim=args.dim, hidden_dim=hidden_dim,
+                act_fn=args.act_fn.get_function() if hasattr(args.act_fn, 'get_function') else None,
+            )
 
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -104,6 +107,17 @@ class TransformerBlock(nn.Module):
             self.post_attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         if args.post_ffn_norm:
             self.post_ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+
+        # Per-layer embedding (Gemma-4): adds per-layer input before attention
+        self._has_per_layer_embed = False
+        if hasattr(args, 'per_layer_embed_dim') and args.per_layer_embed_dim and args.per_layer_embed_dim > 0:
+            pld = args.per_layer_embed_dim  # typically 256
+            self.per_layer_input_gate = nn.Linear(args.dim, pld, bias=False)
+            self.per_layer_projection = nn.Linear(pld, args.dim, bias=False)
+            self.post_per_layer_input_norm = RMSNorm(args.dim, eps=args.norm_eps)
+            self.layer_scalar = nn.Parameter(torch.ones(1))
+            self._has_per_layer_embed = True
+            self._layer_id = layer_id
 
     @classmethod
     def from_type(cls, layer_id, args, rope) -> "TransformerBlock":
@@ -124,6 +138,15 @@ class TransformerBlock(nn.Module):
         return TransformerBlock(args, attention)
 
     def forward(self, x, freqs_cos, freqs_sin, attn_options: ForwardOptions):  # x: 1xN
+        # Per-layer embedding injection (Gemma-4)
+        if self._has_per_layer_embed:
+            per_layer_emb = attn_options.get("_per_layer_embs")
+            if per_layer_emb is not None:
+                # per_layer_emb: [B, S, per_layer_embed_dim] for this layer
+                gate = torch.sigmoid(self.per_layer_input_gate(x))
+                projected = self.per_layer_projection(gate * per_layer_emb)
+                x = x + self.layer_scalar * self.post_per_layer_input_norm(projected)
+
         h, attn_options_update = self.attention.forward(
             self.attention_norm(x), freqs_cos, freqs_sin, **attn_options
         )
@@ -178,6 +201,15 @@ class Transformer(nn.Module):
         self.input_prune_map = params.input_prune_map
         self.output_prune_map = params.output_prune_map
 
+        # Per-layer embedding table (Gemma-4): [vocab, n_layers * per_layer_embed_dim]
+        self._per_layer_embed_dim = getattr(params, 'per_layer_embed_dim', 0) or 0
+        self._kv_donor_map = params.kv_donor_map or {}
+        self._final_logit_softcapping = getattr(params, 'final_logit_softcapping', 0.0)
+        if self._per_layer_embed_dim > 0:
+            self.embed_tokens_per_layer = nn.Embedding(
+                params.vocab_size, params.n_layers * self._per_layer_embed_dim
+            )
+
     def forward(
         self,
         tokens: Optional[torch.LongTensor] = None,  # tokens
@@ -201,10 +233,37 @@ class Transformer(nn.Module):
         # Make a shallow copy so the updates don't get captured by export
         attn_options_ = attn_options.copy() if attn_options is not None else {}
         attn_options_update = None
-        for layer in self.layers:
+
+        # Per-layer embedding: slice per layer from embed_tokens_per_layer
+        per_layer_embs_all = None
+        if self._per_layer_embed_dim > 0 and hasattr(self, 'embed_tokens_per_layer') and tokens is not None:
+            # embed_tokens_per_layer: [vocab, n_layers * pld]
+            pld = self._per_layer_embed_dim
+            per_layer_embs_all = self.embed_tokens_per_layer(tokens)  # [B, S, n_layers * pld]
+
+        # Collect donor KV caches for shared-KV layers
+        donor_caches = {}
+
+        for layer_idx, layer in enumerate(self.layers):
+            # Inject per-layer embedding for this layer
+            if per_layer_embs_all is not None:
+                pld = self._per_layer_embed_dim
+                layer_emb = per_layer_embs_all[:, :, layer_idx * pld : (layer_idx + 1) * pld]
+                attn_options_["_per_layer_embs"] = layer_emb
+            else:
+                attn_options_.pop("_per_layer_embs", None)
+
+            # Pass donor caches for shared KV layers
+            attn_options_["_donor_caches"] = donor_caches
+
             h, attn_options_update = layer(h, freqs_cos, freqs_sin, attn_options_)
             if attn_options_update is not None:
                 attn_options_.update(**attn_options_update)
+
+            # After forward, store this layer's KV cache for potential donors
+            attn = layer.attention if hasattr(layer, 'attention') else None
+            if attn is not None and hasattr(attn, 'kv_cache') and attn.kv_cache is not None:
+                donor_caches[layer_idx] = (attn.kv_cache.k_cache, attn.kv_cache.v_cache)
 
         if not self.generate_full_logits:
             # Only the last logit is used for the new generated token
@@ -215,6 +274,11 @@ class Transformer(nn.Module):
 
         if self.apply_output:
             logits = self.output(h)
+
+            # Gemma-4: final logit softcapping → tanh(logits/cap) * cap
+            if self._final_logit_softcapping > 0:
+                cap = self._final_logit_softcapping
+                logits = torch.tanh(logits / cap) * cap
 
             if self.output_prune_map is not None:
                 # expand to original size so that downstream applications can use the logits as-is.

@@ -439,6 +439,15 @@ class AttentionMHA(Attention):
 
         self.rope = rope
 
+        # Determine if this layer uses shared KV from a donor layer
+        self._kv_donor_id = None
+        if args.kv_donor_map and layer_id in args.kv_donor_map:
+            self._kv_donor_id = args.kv_donor_map[layer_id]
+
+        # Determine layer type for sliding window
+        layer_type = args.get_layer_type(layer_id)
+        self._is_sliding = (layer_type == "sliding_attention")
+
         causal_mask = torch.tril(
             torch.ones(
                 self.max_context_len,
@@ -450,13 +459,27 @@ class AttentionMHA(Attention):
         self.register_buffer("mask", causal_mask, persistent=False)
 
         if self.use_kv_cache:
-            self.kv_cache = KVCache(
-                args.max_batch_size,
-                args.max_context_len,
-                self.n_kv_heads,
-                self.head_dim,
-                args.enable_dynamic_shape,
-            )
+            if self._kv_donor_id is not None:
+                # Shared KV layer: no own cache (will read from donor at runtime)
+                self.kv_cache = None
+            elif self._is_sliding and args.sliding_window is not None:
+                # Sliding attention: ring buffer KV cache
+                self.kv_cache = RingKVCache(
+                    args.max_batch_size,
+                    args.sliding_window,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    args.enable_dynamic_shape,
+                )
+            else:
+                # Full attention: standard KV cache
+                self.kv_cache = KVCache(
+                    args.max_batch_size,
+                    args.max_context_len,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    args.enable_dynamic_shape,
+                )
             self.SDPA = SDPA(
                 dim=self.n_local_heads * self.head_dim,
                 head_dim=self.head_dim,
@@ -474,12 +497,22 @@ class AttentionMHA(Attention):
         input_pos = kwargs.get("input_pos")
         bsz, seqlen, _ = x.shape
 
-        # QKV
-        q, k, v = self.wq(x), self.wk(x), self.wv(x)
-        # We need view_copy elimination
+        # Q projection (always computed)
+        q = self.wq(x)
         q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        k = k.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        v = v.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        # K/V: compute own or read from donor cache
+        if self._kv_donor_id is not None and self.use_kv_cache:
+            # Shared KV: still compute K for RoPE application, but use donor's cache
+            k = self.wk(x)
+            v = self.wv(x)
+            k = k.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            v = v.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        else:
+            k = self.wk(x)
+            v = self.wv(x)
+            k = k.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            v = v.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
         if self.use_qk_norm and self.qk_norm_before_rope:
             q = self.q_norm_fn(q)
@@ -505,22 +538,34 @@ class AttentionMHA(Attention):
 
         if self.use_kv_cache:
             assert input_pos is not None
-            if self.enable_dynamic_shape:
+
+            if self._kv_donor_id is not None:
+                # Shared KV: update donor's cache with THIS layer's K/V, then read
+                # The donor cache is accessed via kwargs (set by Transformer.forward)
+                donor_cache = kwargs.get("_donor_caches", {}).get(self._kv_donor_id)
+                if donor_cache is not None:
+                    k_full, v_full = donor_cache
+                else:
+                    # Fallback: use own K/V (no donor available)
+                    k_full, v_full = k, v
+            else:
+                # Own cache: update and read
+                k_full, v_full = self.kv_cache.update(input_pos, k, v)
+
+            if self.kv_cache is not None and getattr(self.kv_cache, "is_ring_buffer", False):
+                attn_mask = self.kv_cache.create_causal_mask_for_ring_buffer(
+                    input_pos[0].item(), seqlen
+                )
+            elif self.enable_dynamic_shape:
                 start_pos = input_pos[-1].item()
                 torch._check_is_size(start_pos)
                 torch._check(start_pos < self.max_context_len)
                 seq_length = q.size(2)
-                # pyre-ignore: Incompatible parameter type [6]
                 attn_mask = self.mask.narrow(0, start_pos, seq_length)
             else:
-                # mask is always 2D
                 attn_mask = self.mask[input_pos]
-            k, v = self.kv_cache.update(input_pos, k, v)
-            if getattr(self.kv_cache, "is_ring_buffer", False):
-                attn_mask = self.kv_cache.create_causal_mask_for_ring_buffer(
-                    input_pos[0].item(), seqlen
-                )
-            output = self.SDPA(input_pos, q, k, v, bsz, seqlen, attn_mask)
+
+            output = self.SDPA(input_pos, q, k_full, v_full, bsz, seqlen, attn_mask)
             return self.wo(output), None
 
         # grouped multiquery attention: expand out keys and values
