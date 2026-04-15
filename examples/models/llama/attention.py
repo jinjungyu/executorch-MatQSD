@@ -344,13 +344,13 @@ class AttentionMHA(Attention):
         super().__init__()
         self.use_kv_cache = args.use_kv_cache
         self.n_heads = args.n_heads
-        self.n_kv_heads = self.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        self.n_kv_heads = args.get_n_kv_heads(layer_id)
         assert self.n_heads % self.n_kv_heads == 0
         model_parallel_size = 1
         self.n_local_heads = self.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.head_dim
+        self.head_dim = args.get_head_dim(layer_id)
         self.max_batch_size = args.max_batch_size
         self.max_context_len = args.max_context_len
         self.dim = args.dim
@@ -368,7 +368,7 @@ class AttentionMHA(Attention):
         self.wq = (
             LoRALinear(
                 in_dim=args.dim,
-                out_dim=args.n_heads * args.head_dim,
+                out_dim=args.n_heads * self.head_dim,
                 rank=args.r,
                 alpha=args.lora_alpha,
                 dropout=0.0,
@@ -382,7 +382,7 @@ class AttentionMHA(Attention):
         self.wk = (
             LoRALinear(
                 in_dim=args.dim,
-                out_dim=args.n_kv_heads * args.head_dim,
+                out_dim=self.n_kv_heads * self.head_dim,
                 rank=args.r,
                 alpha=args.lora_alpha,
                 dropout=0.0,
@@ -396,7 +396,7 @@ class AttentionMHA(Attention):
         self.wv = (
             LoRALinear(
                 in_dim=args.dim,
-                out_dim=args.n_kv_heads * args.head_dim,
+                out_dim=self.n_kv_heads * self.head_dim,
                 rank=args.r,
                 alpha=args.lora_alpha,
                 dropout=0.0,
@@ -409,7 +409,7 @@ class AttentionMHA(Attention):
         )
         self.wo = (
             LoRALinear(
-                in_dim=args.n_kv_heads * args.head_dim,
+                in_dim=self.n_kv_heads * self.head_dim,
                 out_dim=args.dim,
                 rank=args.r,
                 alpha=args.lora_alpha,
@@ -421,6 +421,21 @@ class AttentionMHA(Attention):
         )
 
         self.layer_id = layer_id
+
+        # Per-layer RoPE: if layer has different rope params, create layer-local rope
+        layer_rope_theta = args.get_rope_theta(layer_id)
+        layer_prf = args.get_partial_rotary_factor(layer_id)
+        if (args.per_layer_rope_theta is not None or args.per_layer_partial_rotary_factor is not None):
+            # Create per-layer RoPE frequencies
+            from executorch.examples.models.llama.rope import hf_precompute_freqs_cis
+            freqs_cos, freqs_sin = hf_precompute_freqs_cis(
+                self.head_dim, args.max_context_len, layer_rope_theta, layer_prf
+            )
+            self.register_buffer("layer_freqs_cos", freqs_cos, persistent=False)
+            self.register_buffer("layer_freqs_sin", freqs_sin, persistent=False)
+            self._use_layer_rope = True
+        else:
+            self._use_layer_rope = False
 
         self.rope = rope
 
@@ -470,7 +485,14 @@ class AttentionMHA(Attention):
             q = self.q_norm_fn(q)
             k = self.k_norm_fn(k)
 
-        # RoPE relative positional embeddings
+        # RoPE relative positional embeddings (per-layer override if available)
+        if self._use_layer_rope:
+            if input_pos is not None:
+                freqs_cos = self.layer_freqs_cos[input_pos]
+                freqs_sin = self.layer_freqs_sin[input_pos]
+            else:
+                freqs_cos = self.layer_freqs_cos[:seqlen]
+                freqs_sin = self.layer_freqs_sin[:seqlen]
         q, k = self.rope.forward(q, k, freqs_cos, freqs_sin)
 
         q = q.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)

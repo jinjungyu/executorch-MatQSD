@@ -71,7 +71,7 @@ class MOEFeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, attention: Attention):
+    def __init__(self, args: ModelArgs, attention: Attention, layer_id: int = 0):
         """
         Transformer block with support for pre-norm and post-norm.
         Args:
@@ -79,24 +79,31 @@ class TransformerBlock(nn.Module):
             attention (Attention): attention object to use in the transformer
                 block. See `attention.py` for types of attention. Make sure
                 the attention type is registered in the ATTENTION_REGISTRY.
+            layer_id (int): layer index, used for per-layer dimension resolution.
         """
         super().__init__()
         self.use_kv_cache = args.use_kv_cache
         self.n_heads = args.n_heads
         self.dim = args.dim
-        self.head_dim = args.head_dim
+        self.head_dim = args.get_head_dim(layer_id)
         self.attention = attention
 
+        hidden_dim = args.get_hidden_dim(layer_id)
         assert (
-            args.hidden_dim is not None
+            hidden_dim is not None
         ), "`hidden_dim` must be set in ModelArgs to construct a TransformerBlock."
         if args.moe:
             self.block_sparse_moe = MOEFeedForward(args)
         else:
-            self.feed_forward = FeedForward(dim=args.dim, hidden_dim=args.hidden_dim)
+            self.feed_forward = FeedForward(dim=args.dim, hidden_dim=hidden_dim)
 
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+
+        if args.post_attention_norm:
+            self.post_attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        if args.post_ffn_norm:
+            self.post_ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
     @classmethod
     def from_type(cls, layer_id, args, rope) -> "TransformerBlock":
@@ -120,12 +127,17 @@ class TransformerBlock(nn.Module):
         h, attn_options_update = self.attention.forward(
             self.attention_norm(x), freqs_cos, freqs_sin, **attn_options
         )
+        if hasattr(self, "post_attention_norm"):
+            h = self.post_attention_norm(h)
 
         h = x + h
         if hasattr(self, "block_sparse_moe"):
-            out = h + self.block_sparse_moe(self.ffn_norm(h))
+            ffn_out = self.block_sparse_moe(self.ffn_norm(h))
         else:
-            out = h + self.feed_forward(self.ffn_norm(h))
+            ffn_out = self.feed_forward(self.ffn_norm(h))
+        if hasattr(self, "post_ffn_norm"):
+            ffn_out = self.post_ffn_norm(ffn_out)
+        out = h + ffn_out
         return out, attn_options_update
 
 
@@ -265,7 +277,7 @@ def construct_transformer(model_args: ModelArgs) -> Transformer:
             attention = cls(
                 model_args, layer_id, rope, **model_args.attention_kwargs
             )  # pyre-ignore[45]
-            transformer_block = TransformerBlock(model_args, attention)
+            transformer_block = TransformerBlock(model_args, attention, layer_id)
             layers.append(transformer_block)
 
     return Transformer(model_args, layers, rope)

@@ -15,6 +15,8 @@
 #include <executorch/extension/tensor/tensor.h>
 // MatQSD mode switching (declared in xnnpack.h)
 extern "C" void xnn_set_mqint8_global_mode(int mode);
+extern "C" void xnn_set_mqint8_float_zp_mode(int enable);
+extern "C" int xnn_get_mqint8_float_zp_mode(void);
 
 #if defined(ET_USE_THREADPOOL)
 #include <executorch/extension/threadpool/cpuinfo_utils.h>
@@ -31,6 +33,7 @@ DEFINE_int32(max_new_tokens, 64, "Max tokens to generate");
 DEFINE_int32(K, 5, "Draft tokens per SD step");
 DEFINE_int32(cpu_threads, 4, "CPU threads");
 DEFINE_int32(seq_len, 128, "Max sequence length");
+DEFINE_bool(float_zp, false, "Enable asymmetric float zero-point mode for mqint8");
 
 namespace llm = ::executorch::extension::llm;
 using ::executorch::extension::TensorPtr;
@@ -71,6 +74,12 @@ int main(int argc, char** argv) {
         ->_unsafe_reset_threadpool(FLAGS_cpu_threads);
   }
 #endif
+
+  // Enable float zero-point mode if requested
+  if (FLAGS_float_zp) {
+    xnn_set_mqint8_float_zp_mode(1);
+    std::cout << "[mqint8] Float zero-point mode ENABLED" << std::endl;
+  }
 
   int K = FLAGS_K;
   int max_new = FLAGS_max_new_tokens;

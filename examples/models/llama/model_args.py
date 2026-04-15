@@ -2,7 +2,7 @@ import dataclasses
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch.nn.functional as F
 
@@ -113,6 +113,15 @@ class ModelArgs:
     attention_kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
     # Hybrid models can have layer types different from attention
     layer_types: Optional[list] = None
+    # Per-layer overrides for non-uniform architectures (Gemma-4)
+    per_layer_hidden_dim: Optional[List[int]] = None
+    per_layer_head_dim: Optional[List[int]] = None
+    per_layer_n_kv_heads: Optional[List[int]] = None
+    per_layer_rope_theta: Optional[List[float]] = None
+    per_layer_partial_rotary_factor: Optional[List[float]] = None
+    sliding_window: Optional[int] = None
+    # Map layer_id → donor_layer_id for KV cache sharing (Gemma-4)
+    kv_donor_map: Optional[Dict[int, int]] = None
 
     def __post_init__(self):
         if self.n_kv_heads is None:
@@ -147,3 +156,33 @@ class ModelArgs:
         # Convert string act_fn to enum if needed
         if isinstance(self.act_fn, str):
             self.act_fn = ActFn.from_string(self.act_fn)
+
+    def get_hidden_dim(self, layer_id: int) -> int:
+        if self.per_layer_hidden_dim:
+            return self.per_layer_hidden_dim[layer_id]
+        return self.hidden_dim
+
+    def get_head_dim(self, layer_id: int) -> int:
+        if self.per_layer_head_dim:
+            return self.per_layer_head_dim[layer_id]
+        return self.head_dim
+
+    def get_n_kv_heads(self, layer_id: int) -> int:
+        if self.per_layer_n_kv_heads:
+            return self.per_layer_n_kv_heads[layer_id]
+        return self.n_kv_heads
+
+    def get_rope_theta(self, layer_id: int) -> float:
+        if self.per_layer_rope_theta:
+            return self.per_layer_rope_theta[layer_id]
+        return self.rope_freq_base
+
+    def get_partial_rotary_factor(self, layer_id: int) -> float:
+        if self.per_layer_partial_rotary_factor:
+            return self.per_layer_partial_rotary_factor[layer_id]
+        return self.partial_rotary_factor
+
+    def get_layer_type(self, layer_id: int) -> str:
+        if self.layer_types:
+            return self.layer_types[layer_id]
+        return self.attention_type
