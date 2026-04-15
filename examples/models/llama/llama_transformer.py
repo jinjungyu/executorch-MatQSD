@@ -282,10 +282,13 @@ class Transformer(nn.Module):
             if attn_options_update is not None:
                 attn_options_.update(**attn_options_update)
 
-            # After forward, store this layer's KV cache for potential donors
+            # After forward, store this layer's K/V for potential donor access
             attn = layer.attention if hasattr(layer, 'attention') else None
-            if attn is not None and hasattr(attn, 'kv_cache') and attn.kv_cache is not None:
-                donor_caches[layer_idx] = (attn.kv_cache.k_cache, attn.kv_cache.v_cache)
+            if attn is not None and attn._kv_donor_id is None:
+                if self.use_kv_cache and hasattr(attn, 'kv_cache') and attn.kv_cache is not None:
+                    donor_caches[layer_idx] = (attn.kv_cache.k_cache, attn.kv_cache.v_cache)
+                elif hasattr(attn, '_last_k'):
+                    donor_caches[layer_idx] = (attn._last_k, attn._last_v)
 
         if not self.generate_full_logits:
             # Only the last logit is used for the new generated token

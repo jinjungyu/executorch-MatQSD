@@ -113,16 +113,8 @@ def gemma4_to_executorch(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
         else:
             skipped.append(key)
 
-    # Duplicate KV weights for shared layers (layers >= 15)
-    first_shared = _N_LAYERS - _NUM_KV_SHARED_LAYERS
-    for layer_id in range(first_shared, _N_LAYERS):
-        donor = _kv_donor_layer(layer_id)
-        for suffix in [".attention.wk.weight", ".attention.wv.weight",
-                       ".attention.k_norm_fn.weight"]:
-            donor_key = f"layers.{donor}{suffix}"
-            target_key = f"layers.{layer_id}{suffix}"
-            if donor_key in converted and target_key not in converted:
-                converted[target_key] = converted[donor_key].clone()
+    # Shared KV layers (>= 15): do NOT duplicate KV weights.
+    # These layers have no wk/wv modules — they use donor K/V at runtime.
 
     # tie_word_embeddings: output.weight = tok_embeddings.weight
     if "tok_embeddings.weight" in converted and "output.weight" not in converted:

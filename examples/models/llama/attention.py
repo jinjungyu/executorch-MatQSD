@@ -359,11 +359,18 @@ class AttentionMHA(Attention):
         self.qk_norm_before_rope = args.qk_norm_before_rope
         self.enable_dynamic_shape = args.enable_dynamic_shape
 
+        # Shared KV (Gemma-4): check early so we can skip k/v proj creation
+        self._kv_donor_id = None
+        if args.kv_donor_map and layer_id in args.kv_donor_map:
+            self._kv_donor_id = args.kv_donor_map[layer_id]
+
+        self._use_v_norm = False
         if self.use_qk_norm:
-            q_norm_dim = self.head_dim
-            k_norm_dim = self.head_dim
-            self.q_norm_fn = RMSNorm(q_norm_dim, eps=args.norm_eps)
-            self.k_norm_fn = RMSNorm(k_norm_dim, eps=args.norm_eps)
+            self.q_norm_fn = RMSNorm(self.head_dim, eps=args.norm_eps)
+            if self._kv_donor_id is None:
+                self.k_norm_fn = RMSNorm(self.head_dim, eps=args.norm_eps)
+                # v_norm: Gemma-4 applies norm to V (no learnable weight)
+                self._use_v_norm = True
 
         self.wq = (
             LoRALinear(
@@ -379,34 +386,14 @@ class AttentionMHA(Attention):
                 self.dim, self.n_heads * self.head_dim, bias=self.attention_qkv_bias
             )
         )
-        self.wk = (
-            LoRALinear(
-                in_dim=args.dim,
-                out_dim=self.n_kv_heads * self.head_dim,
-                rank=args.r,
-                alpha=args.lora_alpha,
-                dropout=0.0,
-                use_bias=args.attention_qkv_bias,
-            )
-            if args.target_modules is not None and "k_proj" in args.target_modules
-            else nn.Linear(
+        # Shared KV layers skip k/v projections (use donor's K/V directly)
+        if self._kv_donor_id is None:
+            self.wk = nn.Linear(
                 self.dim, self.n_kv_heads * self.head_dim, bias=self.attention_qkv_bias
             )
-        )
-        self.wv = (
-            LoRALinear(
-                in_dim=args.dim,
-                out_dim=self.n_kv_heads * self.head_dim,
-                rank=args.r,
-                alpha=args.lora_alpha,
-                dropout=0.0,
-                use_bias=args.attention_qkv_bias,
-            )
-            if args.target_modules is not None and "v_proj" in args.target_modules
-            else nn.Linear(
+            self.wv = nn.Linear(
                 self.dim, self.n_kv_heads * self.head_dim, bias=self.attention_qkv_bias
             )
-        )
         self.wo = (
             LoRALinear(
                 in_dim=self.n_kv_heads * self.head_dim,
@@ -438,11 +425,6 @@ class AttentionMHA(Attention):
             self._use_layer_rope = False
 
         self.rope = rope
-
-        # Determine if this layer uses shared KV from a donor layer
-        self._kv_donor_id = None
-        if args.kv_donor_map and layer_id in args.kv_donor_map:
-            self._kv_donor_id = args.kv_donor_map[layer_id]
 
         # Determine layer type for sliding window
         layer_type = args.get_layer_type(layer_id)
@@ -501,55 +483,82 @@ class AttentionMHA(Attention):
         q = self.wq(x)
         q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
-        # K/V: compute own or read from donor cache
-        if self._kv_donor_id is not None and self.use_kv_cache:
-            # Shared KV: still compute K for RoPE application, but use donor's cache
-            k = self.wk(x)
-            v = self.wv(x)
-            k = k.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-            v = v.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        else:
-            k = self.wk(x)
-            v = self.wv(x)
-            k = k.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-            v = v.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        if self.use_qk_norm and self.qk_norm_before_rope:
-            q = self.q_norm_fn(q)
-            k = self.k_norm_fn(k)
-
-        # RoPE relative positional embeddings (per-layer override if available)
-        if self._use_layer_rope:
-            if input_pos is not None:
-                freqs_cos = self.layer_freqs_cos[input_pos]
-                freqs_sin = self.layer_freqs_sin[input_pos]
+        if self._kv_donor_id is not None:
+            # Shared KV layer: skip k/v projection, get K/V from donor
+            donor_kv = kwargs.get("_donor_caches", {}).get(self._kv_donor_id)
+            if donor_kv is not None:
+                k, v = donor_kv  # already [B, H, S, D] and post-norm/RoPE
             else:
-                freqs_cos = self.layer_freqs_cos[:seqlen]
-                freqs_sin = self.layer_freqs_sin[:seqlen]
-        q, k = self.rope.forward(q, k, freqs_cos, freqs_sin)
+                # Fallback: zeros (should not happen if donor ran first)
+                k = torch.zeros(bsz, self.n_local_kv_heads, seqlen, self.head_dim,
+                                device=x.device, dtype=x.dtype)
+                v = k
 
-        q = q.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+            # Q: norm + RoPE
+            if self.use_qk_norm:
+                q = self.q_norm_fn(q)
+            if self._use_layer_rope:
+                if input_pos is not None:
+                    fc = self.layer_freqs_cos[input_pos]
+                    fs = self.layer_freqs_sin[input_pos]
+                else:
+                    fc = self.layer_freqs_cos[:seqlen]
+                    fs = self.layer_freqs_sin[:seqlen]
+            else:
+                fc, fs = freqs_cos, freqs_sin
+            # Apply RoPE to Q only (K already has RoPE from donor)
+            from executorch.examples.models.llama.rope import hf_apply_rotary_emb
+            q_for_rope = q  # [B, S, H, D]
+            k_dummy = q[:, :, :1, :]  # dummy K for the rope function
+            q_roped, _ = hf_apply_rotary_emb(q_for_rope, k_dummy, fc, fs)
+            q = q_roped.transpose(1, 2)  # [B, H, S, D]
+            # k, v are already in [B, H, S, D] from donor
 
-        if self.use_qk_norm and not self.qk_norm_before_rope:
-            q = self.q_norm_fn(q)
-            k = self.k_norm_fn(k)
+        else:
+            # Non-shared: compute own K/V
+            k = self.wk(x)
+            v = self.wv(x)
+            k = k.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            v = v.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+            if self.use_qk_norm:
+                q = self.q_norm_fn(q)
+                k = self.k_norm_fn(k)
+
+            # RoPE
+            if self._use_layer_rope:
+                if input_pos is not None:
+                    freqs_cos = self.layer_freqs_cos[input_pos]
+                    freqs_sin = self.layer_freqs_sin[input_pos]
+                else:
+                    freqs_cos = self.layer_freqs_cos[:seqlen]
+                    freqs_sin = self.layer_freqs_sin[:seqlen]
+            q, k = self.rope.forward(q, k, freqs_cos, freqs_sin)
+
+            q = q.transpose(1, 2)  # [B, H, S, D]
+            k = k.transpose(1, 2)
+
+            # v_norm (Gemma-4: normalize V without learnable scale)
+            if self._use_v_norm:
+                v_float = v.float()
+                v = (v_float * torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + 1e-6)).type_as(v)
+            v = v.transpose(1, 2)
+
+            # Store K/V for donor access by shared layers
+            self._last_k = k  # [B, H, S, D]
+            self._last_v = v  # [B, H, S, D]
 
         if self.use_kv_cache:
             assert input_pos is not None
 
             if self._kv_donor_id is not None:
-                # Shared KV: update donor's cache with THIS layer's K/V, then read
-                # The donor cache is accessed via kwargs (set by Transformer.forward)
+                # Shared KV: donor cache already has full K/V
                 donor_cache = kwargs.get("_donor_caches", {}).get(self._kv_donor_id)
                 if donor_cache is not None:
                     k_full, v_full = donor_cache
                 else:
-                    # Fallback: use own K/V (no donor available)
                     k_full, v_full = k, v
             else:
-                # Own cache: update and read
                 k_full, v_full = self.kv_cache.update(input_pos, k, v)
 
             if self.kv_cache is not None and getattr(self.kv_cache, "is_ring_buffer", False):
