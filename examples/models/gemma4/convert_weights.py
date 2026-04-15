@@ -77,19 +77,18 @@ def _get_mapped_key(key: str) -> str:
 
 
 def _kv_donor_layer(layer_id: int) -> int:
-    """For shared-KV layers (>= 15), find the donor layer in the first half.
-    The donor has the same layer_type and is at position (layer_id % 5) in its group.
+    """For shared-KV layers (>= 15), find the donor layer.
+    HF logic: each shared layer uses the LAST non-shared layer of the same type.
+    For Gemma-4 [s,s,s,s,f]×7: all shared sliding → layer 13, all shared full → layer 14.
     """
     if layer_id < _N_LAYERS - _NUM_KV_SHARED_LAYERS:
         return layer_id  # Not shared
-    # Gemma-4 pattern: [s,s,s,s,f] repeating
-    # Layer 15 shares with layer 0, layer 16 with 1, ..., layer 19 with 4, etc.
-    # General: donor = layer_id - num_kv_shared_layers
-    # But only if layer_id - 20 is in [0, 14]
-    donor = layer_id - _NUM_KV_SHARED_LAYERS
-    if donor < 0:
-        donor = layer_id % 5  # fallback
-    return donor
+    # Determine layer type
+    layer_type = _LAYER_TYPES[layer_id]
+    if layer_type == "full_attention":
+        return 14  # Last non-shared full attention layer
+    else:
+        return 13  # Last non-shared sliding attention layer
 
 
 def gemma4_to_executorch(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

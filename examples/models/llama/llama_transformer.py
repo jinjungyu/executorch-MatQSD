@@ -108,13 +108,15 @@ class TransformerBlock(nn.Module):
         if args.post_ffn_norm:
             self.post_ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-        # Per-layer embedding (Gemma-4): adds per-layer input before attention
+        # Per-layer embedding (Gemma-4): applied AFTER attention+FFN residuals
         self._has_per_layer_embed = False
         if hasattr(args, 'per_layer_embed_dim') and args.per_layer_embed_dim and args.per_layer_embed_dim > 0:
             pld = args.per_layer_embed_dim  # typically 256
             self.per_layer_input_gate = nn.Linear(args.dim, pld, bias=False)
             self.per_layer_projection = nn.Linear(pld, args.dim, bias=False)
             self.post_per_layer_input_norm = RMSNorm(args.dim, eps=args.norm_eps)
+            # HF uses the model's activation function (gelu_approx), NOT sigmoid
+            self._per_layer_act_fn = args.act_fn.get_function() if hasattr(args.act_fn, 'get_function') else F.silu
             self._has_per_layer_embed = True
             self._layer_id = layer_id
 
@@ -141,15 +143,6 @@ class TransformerBlock(nn.Module):
         return TransformerBlock(args, attention)
 
     def forward(self, x, freqs_cos, freqs_sin, attn_options: ForwardOptions):  # x: 1xN
-        # Per-layer embedding injection (Gemma-4)
-        if self._has_per_layer_embed:
-            per_layer_emb = attn_options.get("_per_layer_embs")
-            if per_layer_emb is not None:
-                # per_layer_emb: [B, S, per_layer_embed_dim] for this layer
-                gate = torch.sigmoid(self.per_layer_input_gate(x))
-                projected = self.per_layer_projection(gate * per_layer_emb)
-                x = x + self.layer_scalar * self.post_per_layer_input_norm(projected)
-
         h, attn_options_update = self.attention.forward(
             self.attention_norm(x), freqs_cos, freqs_sin, **attn_options
         )
@@ -166,12 +159,13 @@ class TransformerBlock(nn.Module):
         out = h + ffn_out
 
         # Per-layer embedding injection (Gemma-4) — AFTER attention+FFN residuals
+        # HF flow: gate → act_fn → multiply with per_layer_input → project → norm → residual
         if self._has_per_layer_embed:
             per_layer_emb = attn_options.get("_per_layer_embs")
             if per_layer_emb is not None:
                 residual = out
-                gate = torch.sigmoid(self.per_layer_input_gate(out))
-                projected = self.per_layer_projection(gate * per_layer_emb)
+                gated = self._per_layer_act_fn(self.per_layer_input_gate(out))
+                projected = self.per_layer_projection(gated * per_layer_emb)
                 out = residual + self.post_per_layer_input_norm(projected)
 
         # Layer scalar (Gemma-4): unconditional scaling at end of layer
