@@ -50,9 +50,11 @@ _HF_TO_ET = {
     "model.language_model.layers.{}.layer_scalar": "layers.{}.layer_scalar",
 }
 
-# Per-layer embedding table (special: not per-layer indexed)
+# Special keys (not per-layer indexed)
 _HF_TO_ET_SPECIAL = {
     "model.language_model.embed_tokens_per_layer.weight": "embed_tokens_per_layer.weight",
+    "model.language_model.per_layer_model_projection.weight": "per_layer_model_projection.weight",
+    "model.language_model.per_layer_projection_norm.weight": "per_layer_projection_norm.weight",
 }
 
 
@@ -96,8 +98,8 @@ def gemma4_to_executorch(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
     skipped = []
 
     for key, value in state_dict.items():
-        # Skip per-layer model projection (not needed for text-only inference)
-        if "per_layer_model_projection" in key or "per_layer_projection_norm" in key:
+        # Skip multimodal-only projection (embed_vision, embed_audio)
+        if key.startswith("model.embed_vision") or key.startswith("model.embed_audio"):
             skipped.append(key)
             continue
         # Skip audio/vision components

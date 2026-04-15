@@ -206,9 +206,18 @@ class Transformer(nn.Module):
         self._kv_donor_map = params.kv_donor_map or {}
         self._final_logit_softcapping = getattr(params, 'final_logit_softcapping', 0.0)
         if self._per_layer_embed_dim > 0:
+            pld = self._per_layer_embed_dim
             self.embed_tokens_per_layer = nn.Embedding(
-                params.vocab_size, params.n_layers * self._per_layer_embed_dim
+                params.vocab_size, params.n_layers * pld
             )
+            # HF Gemma4: per_layer_model_projection projects main embed to per-layer space
+            self.per_layer_model_projection = nn.Linear(
+                params.dim, params.n_layers * pld, bias=False
+            )
+            self._per_layer_model_projection_scale = params.dim ** -0.5
+            self.per_layer_projection_norm = RMSNorm(pld, eps=params.norm_eps)
+            self._per_layer_input_scale = 2.0 ** -0.5
+            self._per_layer_embed_scale = pld ** 0.5  # ScaledWordEmbedding scale
 
     def forward(
         self,
@@ -222,6 +231,8 @@ class Transformer(nn.Module):
             )
         if self.apply_embedding and tokens is not None and h is None:
             h = self.tok_embeddings(tokens)
+            if self.params.embedding_scale_factor != 1.0:
+                h = h * self.params.embedding_scale_factor
 
         if attn_options is None:
             attn_options = {}
@@ -234,12 +245,25 @@ class Transformer(nn.Module):
         attn_options_ = attn_options.copy() if attn_options is not None else {}
         attn_options_update = None
 
-        # Per-layer embedding: slice per layer from embed_tokens_per_layer
+        # Per-layer embedding (Gemma-4): combine token-level + projection-level embeddings
         per_layer_embs_all = None
         if self._per_layer_embed_dim > 0 and hasattr(self, 'embed_tokens_per_layer') and tokens is not None:
-            # embed_tokens_per_layer: [vocab, n_layers * pld]
             pld = self._per_layer_embed_dim
-            per_layer_embs_all = self.embed_tokens_per_layer(tokens)  # [B, S, n_layers * pld]
+            n_layers = self.n_layers
+            bsz_s = tokens.shape
+
+            # Step 1: per-layer token embeddings (scaled)
+            per_layer_tok = self.embed_tokens_per_layer(tokens)  # [B, S, n_layers * pld]
+            per_layer_tok = per_layer_tok * self._per_layer_embed_scale
+            per_layer_tok = per_layer_tok.view(bsz_s[0], bsz_s[1], n_layers, pld)
+
+            # Step 2: project main embeddings to per-layer space
+            per_layer_proj = self.per_layer_model_projection(h) * self._per_layer_model_projection_scale
+            per_layer_proj = per_layer_proj.view(bsz_s[0], bsz_s[1], n_layers, pld)
+            per_layer_proj = self.per_layer_projection_norm(per_layer_proj)
+
+            # Step 3: combine
+            per_layer_embs_all = (per_layer_proj + per_layer_tok) * self._per_layer_input_scale
 
         # Collect donor KV caches for shared-KV layers
         donor_caches = {}
@@ -247,9 +271,7 @@ class Transformer(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             # Inject per-layer embedding for this layer
             if per_layer_embs_all is not None:
-                pld = self._per_layer_embed_dim
-                layer_emb = per_layer_embs_all[:, :, layer_idx * pld : (layer_idx + 1) * pld]
-                attn_options_["_per_layer_embs"] = layer_emb
+                attn_options_["_per_layer_embs"] = per_layer_embs_all[:, :, layer_idx, :]
             else:
                 attn_options_.pop("_per_layer_embs", None)
 
