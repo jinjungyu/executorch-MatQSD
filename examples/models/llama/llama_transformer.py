@@ -379,4 +379,14 @@ def construct_transformer(model_args: ModelArgs) -> Transformer:
             transformer_block = TransformerBlock(model_args, attention, layer_id)
             layers.append(transformer_block)
 
+    # Wire donor KVCache references for shared-KV layers (export-safe: avoids dict passing)
+    if model_args.kv_donor_map and model_args.use_kv_cache:
+        for layer_id in range(model_args.n_layers):
+            layer = layers[layer_id]
+            attn = getattr(layer, 'attention', None)
+            if attn is not None and attn._kv_donor_id is not None:
+                donor_attn = layers[attn._kv_donor_id].attention
+                # Plain Python attr (not nn.Module child) so donor cache isn't re-registered
+                object.__setattr__(attn, '_donor_kv_cache_ref', donor_attn.kv_cache)
+
     return Transformer(model_args, layers, rope)

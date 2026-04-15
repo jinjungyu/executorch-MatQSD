@@ -442,9 +442,12 @@ class AttentionMHA(Attention):
         )
         self.register_buffer("mask", causal_mask, persistent=False)
 
+        # Will be wired to donor's KVCache in construct_transformer() for shared layers
+        self._donor_kv_cache_ref = None
+
         if self.use_kv_cache:
             if self._kv_donor_id is not None:
-                # Shared KV layer: no own cache (will read from donor at runtime)
+                # Shared KV layer: no own cache (reads from donor's cache via _donor_kv_cache_ref)
                 self.kv_cache = None
             elif self._is_sliding and args.sliding_window is not None:
                 # Sliding attention: ring buffer KV cache
@@ -548,38 +551,58 @@ class AttentionMHA(Attention):
                 v = (v_float * torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + 1e-6)).type_as(v)
             v = v.transpose(1, 2)
 
-            # Store K/V for donor access by shared layers
-            self._last_k = k  # [B, H, S, D]
-            self._last_v = v  # [B, H, S, D]
-
         if self.use_kv_cache:
             assert input_pos is not None
 
             if self._kv_donor_id is not None:
-                # Shared KV: donor cache already has full K/V
-                donor_cache = kwargs.get("_donor_caches", {}).get(self._kv_donor_id)
-                if donor_cache is not None:
-                    k_full, v_full = donor_cache
+                # Shared KV with kv_cache: read from donor's KVCache directly
+                donor_ref = self._donor_kv_cache_ref
+                if donor_ref is not None:
+                    k_full = donor_ref.k_cache
+                    v_full = donor_ref.v_cache
+                    # Use donor's mask (critical for RingKVCache ring buffer layout)
+                    if getattr(donor_ref, "is_ring_buffer", False):
+                        attn_mask = donor_ref.create_causal_mask_for_ring_buffer(
+                            input_pos[0].item(), seqlen
+                        )
+                    elif self.enable_dynamic_shape:
+                        start_pos = input_pos[-1].item()
+                        torch._check_is_size(start_pos)
+                        torch._check(start_pos < self.max_context_len)
+                        seq_length = q.size(2)
+                        attn_mask = self.mask.narrow(0, start_pos, seq_length)
+                    else:
+                        attn_mask = self.mask[input_pos]
                 else:
-                    k_full, v_full = k, v
+                    # Eager fallback: use dict (non-export path)
+                    donor_kv = kwargs.get("_donor_caches", {}).get(self._kv_donor_id)
+                    if donor_kv is not None:
+                        k_full, v_full = donor_kv
+                    else:
+                        k_full, v_full = k, v
+                    attn_mask = self.mask[input_pos]
             else:
                 k_full, v_full = self.kv_cache.update(input_pos, k, v)
-
-            if self.kv_cache is not None and getattr(self.kv_cache, "is_ring_buffer", False):
-                attn_mask = self.kv_cache.create_causal_mask_for_ring_buffer(
-                    input_pos[0].item(), seqlen
-                )
-            elif self.enable_dynamic_shape:
-                start_pos = input_pos[-1].item()
-                torch._check_is_size(start_pos)
-                torch._check(start_pos < self.max_context_len)
-                seq_length = q.size(2)
-                attn_mask = self.mask.narrow(0, start_pos, seq_length)
-            else:
-                attn_mask = self.mask[input_pos]
+                if getattr(self.kv_cache, "is_ring_buffer", False):
+                    attn_mask = self.kv_cache.create_causal_mask_for_ring_buffer(
+                        input_pos[0].item(), seqlen
+                    )
+                elif self.enable_dynamic_shape:
+                    start_pos = input_pos[-1].item()
+                    torch._check_is_size(start_pos)
+                    torch._check(start_pos < self.max_context_len)
+                    seq_length = q.size(2)
+                    attn_mask = self.mask.narrow(0, start_pos, seq_length)
+                else:
+                    attn_mask = self.mask[input_pos]
 
             output = self.SDPA(input_pos, q, k_full, v_full, bsz, seqlen, attn_mask)
             return self.wo(output), None
+
+        # Eager mode: store K/V for donor access by shared layers
+        if self._kv_donor_id is None:
+            self._last_k = k  # [B, H, S, D]
+            self._last_v = v  # [B, H, S, D]
 
         # grouped multiquery attention: expand out keys and values
         k = k.repeat_interleave(self.n_rep, dim=1)
