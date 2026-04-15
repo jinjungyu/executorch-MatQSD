@@ -125,12 +125,14 @@ class SDPA(nn.Module):
         head_dim: int,
         n_rep: int,
         max_context_len: int,
+        attn_scale: Optional[float] = None,
     ):
         super().__init__()
         self.dim = dim
         self.head_dim = head_dim
         self.n_rep = n_rep
         self.max_context_len = max_context_len
+        self.attn_scale = attn_scale  # None = default 1/sqrt(head_dim)
 
     def forward(
         self,
@@ -143,11 +145,11 @@ class SDPA(nn.Module):
         mask: torch.Tensor,
     ) -> torch.Tensor:
 
-        # TODO(kimishpatel): This should not be necessary because scaled_dot_product_attention
-        # can natively support GQA now. But needs enable_gqa=True
         k = k.repeat_interleave(self.n_rep, dim=1)
         v = v.repeat_interleave(self.n_rep, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        y = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, scale=self.attn_scale
+        )
 
         return y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
@@ -467,6 +469,8 @@ class AttentionMHA(Attention):
                 head_dim=self.head_dim,
                 n_rep=self.n_rep,
                 max_context_len=self.max_context_len,
+                # When qk_norm is used (Gemma-4), HF uses scaling=1.0 instead of 1/sqrt(d)
+                attn_scale=1.0 if self.use_qk_norm else None,
             )
 
     def forward(
@@ -585,7 +589,8 @@ class AttentionMHA(Attention):
 
         mask = self.mask[:seqlen, :seqlen]
 
-        output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        _scale = 1.0 if self.use_qk_norm else None
+        output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, scale=_scale)
 
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 

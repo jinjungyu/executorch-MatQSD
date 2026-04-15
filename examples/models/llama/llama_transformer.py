@@ -115,9 +115,12 @@ class TransformerBlock(nn.Module):
             self.per_layer_input_gate = nn.Linear(args.dim, pld, bias=False)
             self.per_layer_projection = nn.Linear(pld, args.dim, bias=False)
             self.post_per_layer_input_norm = RMSNorm(args.dim, eps=args.norm_eps)
-            self.layer_scalar = nn.Parameter(torch.ones(1))
             self._has_per_layer_embed = True
             self._layer_id = layer_id
+
+        # Layer scalar (Gemma-4): applied unconditionally at the end of each layer
+        # Initialized to 1.0 (no-op for non-Gemma models); loaded from checkpoint
+        self.layer_scalar = nn.Parameter(torch.ones(1))
 
     @classmethod
     def from_type(cls, layer_id, args, rope) -> "TransformerBlock":
@@ -161,6 +164,19 @@ class TransformerBlock(nn.Module):
         if hasattr(self, "post_ffn_norm"):
             ffn_out = self.post_ffn_norm(ffn_out)
         out = h + ffn_out
+
+        # Per-layer embedding injection (Gemma-4) — AFTER attention+FFN residuals
+        if self._has_per_layer_embed:
+            per_layer_emb = attn_options.get("_per_layer_embs")
+            if per_layer_emb is not None:
+                residual = out
+                gate = torch.sigmoid(self.per_layer_input_gate(out))
+                projected = self.per_layer_projection(gate * per_layer_emb)
+                out = residual + self.post_per_layer_input_norm(projected)
+
+        # Layer scalar (Gemma-4): unconditional scaling at end of layer
+        out = out * self.layer_scalar
+
         return out, attn_options_update
 
 
