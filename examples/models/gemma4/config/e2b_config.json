@@ -12,7 +12,7 @@
   "act_fn": "gelu_approx",
   "use_hf_rope": true,
   "use_qk_norm": true,
-  "qk_norm_before_rope": false,
+  "qk_norm_before_rope": true,
   "post_attention_norm": true,
   "post_ffn_norm": true,
   "rope_theta": 10000.0,
