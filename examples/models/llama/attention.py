@@ -513,6 +513,8 @@ class AttentionMHA(Attention):
                     fs = self.layer_freqs_sin[:seqlen]
             else:
                 fc, fs = freqs_cos, freqs_sin
+            fc = fc.to(q.dtype)
+            fs = fs.to(q.dtype)
             # Apply RoPE to Q only (K already has RoPE from donor)
             from executorch.examples.models.llama.rope import hf_apply_rotary_emb
             q_for_rope = q  # [B, S, H, D]
@@ -532,7 +534,7 @@ class AttentionMHA(Attention):
                 q = self.q_norm_fn(q)
                 k = self.k_norm_fn(k)
 
-            # RoPE
+            # RoPE (cast freqs to match Q/K dtype for bf16/fp16 consistency)
             if self._use_layer_rope:
                 if input_pos is not None:
                     freqs_cos = self.layer_freqs_cos[input_pos]
@@ -540,6 +542,8 @@ class AttentionMHA(Attention):
                 else:
                     freqs_cos = self.layer_freqs_cos[:seqlen]
                     freqs_sin = self.layer_freqs_sin[:seqlen]
+            freqs_cos = freqs_cos.to(q.dtype)
+            freqs_sin = freqs_sin.to(q.dtype)
             q, k = self.rope.forward(q, k, freqs_cos, freqs_sin)
 
             q = q.transpose(1, 2)  # [B, H, S, D]
@@ -596,6 +600,9 @@ class AttentionMHA(Attention):
                 else:
                     attn_mask = self.mask[input_pos]
 
+            # Ensure Q/K/V dtype consistency (norm/rope may promote to float)
+            q = q.to(k_full.dtype)
+            v_full = v_full.to(k_full.dtype)
             output = self.SDPA(input_pos, q, k_full, v_full, bsz, seqlen, attn_mask)
             return self.wo(output), None
 

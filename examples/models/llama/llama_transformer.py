@@ -121,8 +121,11 @@ class TransformerBlock(nn.Module):
             self._layer_id = layer_id
 
         # Layer scalar (Gemma-4): applied unconditionally at the end of each layer
-        # Initialized to 1.0 (no-op for non-Gemma models); loaded from checkpoint
-        self.layer_scalar = nn.Parameter(torch.ones(1))
+        # Only created when per_layer_embed is active (Gemma-4); skipped for Llama
+        self._has_layer_scalar = False
+        if self._has_per_layer_embed:
+            self.layer_scalar = nn.Parameter(torch.ones(1))
+            self._has_layer_scalar = True
 
     @classmethod
     def from_type(cls, layer_id, args, rope) -> "TransformerBlock":
@@ -169,7 +172,8 @@ class TransformerBlock(nn.Module):
                 out = residual + self.post_per_layer_input_norm(projected)
 
         # Layer scalar (Gemma-4): unconditional scaling at end of layer
-        out = out * self.layer_scalar
+        if self._has_layer_scalar:
+            out = out * self.layer_scalar
 
         return out, attn_options_update
 

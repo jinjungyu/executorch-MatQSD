@@ -52,4 +52,5 @@ class RMSNorm(torch.nn.Module):
 
         """
         output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        # Cast weight to input dtype to preserve bf16/fp16 dtype through norm
+        return output * self.weight.to(x.dtype)
